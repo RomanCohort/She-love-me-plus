@@ -43,6 +43,8 @@ symmetry_score = round(
 
 **优先读取 `stats.json` 中的 `positive_emotion_count` 和 `negative_emotion_count`**，计算基础比值。
 
+> ⚠️ 若 `positive_emotion_ratio` 为 `null`，说明该方情绪词总量为 0——**这个比值从未被测量过**。禁止据此推导 Gottman 比值，改用文本判断并在输出中说明原因。
+
 然后用文本判断校正以下边界情况（`stats.json` 词典无法区分的）：
 - 「随便」：在冷战语境 → 计入负向；在轻松语境 → 不计
 - 「无所谓」：在拒绝情感请求后 → 计入负向；作为口头禅 → 不计
@@ -67,6 +69,18 @@ symmetry_score = round(
 }
 ```
 
+**`evidence_level` 分级标准**（三条同时看：数量 / 独立性 / 一致性。不得凭感觉填）：
+
+| evidence_level | 判据 |
+|---------------|------|
+| `high` | ≥3 处**独立**证据，跨 ≥2 个时间段，方向一致，且无相反证据 |
+| `medium` | 2 处独立证据；或 1 处强证据（原话明确）+ 1 处行为证据 |
+| `low` | 仅 1 处证据；或证据方向相互冲突，需人工判读 |
+| `insufficient` | 无证据，或全部「证据」来自对单条消息的推断 |
+
+> **情感信号类结论**按 `analysis-framework.md` F5 的轴命中数映射：≥3 轴 → `high`，2 轴 → `medium`，1 轴 → `low`，0 轴不写入。
+> 分级只有这 4 个取值，**不要新增第五个**——`insufficient` 被本文件与 SKILL.md 铁律 5 同时锚定，加值会让两处一起失效。
+
 | 字段 | 输出 null 的条件 |
 |------|----------------|
 | `partner_attachment` | 对方文字消息不足 80 条，或行为模式高度混合无法归类 |
@@ -76,6 +90,16 @@ symmetry_score = round(
 | `fatal_mistake` | 未发现明显的自我价值损耗行为 |
 | `advancement_path` | 关系类型为「名存实亡」或「朋友边界」时 |
 | `pursue_distance_loop` | 未发现典型追逃案发现场 |
+| `affinity.total` | 不足 4 维有分时置 `null` —— **`dimensions` 仍须完整保留**，缺哪几维、为什么，写在 `total_note` |
+| `affinity.dimensions[].score` | 该维证据不足时置 `null` + `evidence_level: "insufficient"`，**不得给 0 分**（0 分是「明确不愿继续交流」，与「没数据」是两件事） |
+| `intent_profile` | 可可靠归类的消息不足 30 条时 |
+| `moments` | 无 `confidence ≥ 0.65` 的时刻时输出 `[]`（空列表，不是 `null`） |
+| `reply_grades` | 未发现关系关键时刻的回复时输出 `[]`（空列表，不是 `null`） |
+
+> **新增维度一律复用上面第 82 行那 4 个 `evidence_level` 取值**（`high` / `medium` / `low` / `insufficient`）。
+> `affinity` 与 `reply_grades` 的完整出分规则见 `.agents/skills/she-love-me/references/scoring-rubrics.md`；
+> `intent_profile` / `moments` / `emotion_distribution` 的词表见
+> `.agents/skills/she-love-me/references/intent-taxonomy.md`。
 
 ---
 
@@ -108,6 +132,60 @@ symmetry_score = round(
       "event": "那次关于XX的争吵后，对方回复速度断崖式下降，从分钟级变为天级"
     }
   },
+
+  "affinity": {
+    "total": 68,
+    "total_note": "六维中 4 维有分；其中「亲密表达」为文本依据，未经统计锚点校正",
+    "boundary_applied": false,
+    "boundary_reason": null,
+    "dimensions": [
+      {
+        "key": "主动延续",
+        "weight": 15,
+        "level": 2,
+        "score": 25,
+        "basis": "quant",
+        "derivation": "c_metrics.session_gaps.h12.them_starts = 4（口径 12h），对照基线判为档 2",
+        "evidence_level": "high",
+        "note": "……",
+        "evidence": [{"quote": "……", "date": "YYYY-MM-DD"}]
+      },
+      {
+        "key": "亲密表达",
+        "weight": 20,
+        "level": 3,
+        "score": 50,
+        "basis": "text",
+        "derivation": "无统计锚点，据 3 处原文判定为档 3（友好自然但无明确恋爱意味）",
+        "evidence_level": "medium",
+        "note": "……",
+        "evidence": [{"quote": "……", "date": "YYYY-MM-DD"}]
+      }
+    ]
+  },
+
+  "moments": [
+    {
+      "date": "YYYY-MM-DD",
+      "sender": "them",
+      "kind": "boundary",
+      "title": "一句话标题",
+      "quote": "原始消息",
+      "status": "active",
+      "confidence": 0.8,
+      "resolution": null
+    },
+    {
+      "date": "YYYY-MM-DD",
+      "sender": "me",
+      "kind": "reopen",
+      "title": "一句话标题",
+      "quote": "原始消息",
+      "status": "active",
+      "confidence": 0.7,
+      "resolution": null
+    }
+  ],
 
   "personality_portrait": {
     "user": {
@@ -183,7 +261,26 @@ symmetry_score = round(
     "future_orientation": "中性偏虚 — 有未来规划的表达，但多数未落地为具体行动",
     "emotional_valence_ratio": "用户正负比约 3:1，对方正负比约 2:1",
     "conditional_density": "高 — 对方频繁使用条件句",
-    "key_linguistic_finding": "对方在同一段对话中同时出现「我会好好爱你」和「我们不合适」"
+    "key_linguistic_finding": "对方在同一段对话中同时出现「我会好好爱你」和「我们不合适」",
+    "emotion_distribution": [
+      {"label": "平静", "me": 320, "them": 410},
+      {"label": "调侃", "me": 96, "them": 58}
+    ]
+  },
+
+  "intent_profile": {
+    "total_classified": 981,
+    "coverage": "全量 1541 条中 981 条可可靠归类（64%）",
+    "caveat": "其余落在 other/unknown，未强行归类",
+    "categories": [
+      {
+        "intent": "学术讨论",
+        "me": 96,
+        "them": 210,
+        "evidence_level": "high",
+        "evidence": [{"quote": "……", "date": "YYYY-MM-DD", "sender": "them"}]
+      }
+    ]
   },
 
   "sternberg": {
@@ -272,6 +369,18 @@ symmetry_score = round(
       "reason": "此时继续投入的成本已超出任何可能的回报"
     }
   },
+
+  "reply_grades": [
+    {
+      "quote": "你发出去的原话",
+      "date": "YYYY-MM-DD",
+      "context": "对方刚说了什么 / 当时什么状态",
+      "grade": "D",
+      "score": 35,
+      "reason": "为什么打这个分（结合语境，不是泛泛而谈）",
+      "alternatives": ["替代表达一", "替代表达二", "不回复，就此打住"]
+    }
+  ],
 
   "key_findings": [
     {

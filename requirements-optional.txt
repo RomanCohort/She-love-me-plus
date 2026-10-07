@@ -1,0 +1,14 @@
+# she-love-me 的可选依赖 —— 只有情感计算层（affect）需要。
+#
+# 主分析路径（stats_analyzer.py + lexicon.py）零第三方依赖，不装这些也能跑。
+# 装了之后 stats_analyzer.py --affect auto 才会启用情感计算层。
+#
+#   python -m pip install -r requirements-optional.txt
+#
+# 注意这里**没有 torch**：句向量走 ONNX 运行时，onnxruntime 是 ~40MB 的轮子，
+# torch 是 2GB 起步。见 scripts/embed_hf.py 顶部说明。
+
+numpy>=1.24
+onnxruntime>=1.20        # 1.20 起有 Python 3.13 的 wheel
+tokenizers>=0.20
+huggingface_hub>=0.24

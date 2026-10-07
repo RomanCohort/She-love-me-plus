@@ -21,7 +21,13 @@ def contact_export_dir(root_dir, contact_display, contact_username=None):
     return os.path.join(root_dir, f"{slug}__{suffix}")
 
 
-def resolve_bundle_paths(contact_display, contact_username=None, output=None, output_dir=None):
+# 图片/表情包落盘的默认根目录。与 messages.json 分开，因为媒体是二进制、
+# 体积大且可能上百个文件，不适合塞进联系人 bundle 目录里一起管理。
+DEFAULT_MEDIA_ROOT = os.path.join("data", "media")
+
+
+def resolve_bundle_paths(contact_display, contact_username=None, output=None, output_dir=None,
+                         media_root=None):
     if output and output_dir:
         raise ValueError("output and output_dir cannot be used together")
 
@@ -39,6 +45,8 @@ def resolve_bundle_paths(contact_display, contact_username=None, output=None, ou
 
     bundle_dir = os.path.abspath(bundle_dir)
     messages_path = os.path.abspath(messages_path)
+    media_dir = contact_export_dir(
+        os.path.abspath(media_root or DEFAULT_MEDIA_ROOT), contact_display, contact_username)
     return {
         "bundle_dir": bundle_dir,
         "messages_path": messages_path,
@@ -51,4 +59,6 @@ def resolve_bundle_paths(contact_display, contact_username=None, output=None, ou
         "chat_history_path": os.path.join(bundle_dir, "chat_history.txt"),
         "analysis_path": os.path.join(bundle_dir, "analysis.json"),
         "reports_dir": os.path.join(bundle_dir, "reports"),
+        "media_dir_path": media_dir,
+        "media_index_path": os.path.join(media_dir, "media_index.json"),
     }

@@ -20,18 +20,13 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+
+from lexicon import count_conflict
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
-
-# 负向情绪词（与 stats_analyzer.py 保持一致）
-NEGATIVE_WORDS = [
-    "烦", "累", "难过", "伤心", "痛苦", "委屈", "生气", "愤怒", "失望", "绝望",
-    "算了", "无所谓", "随便", "不想", "放弃", "好累", "心累", "难受", "伤", "哭",
-    "不合适", "不想说了", "随便你", "冷漠", "消失", "已读不回", "不理"
-]
 
 GAP_THRESHOLD = 24 * 3600  # 24 小时沉默 = 修复时刻边界
 
@@ -42,19 +37,15 @@ def load_messages(path):
 
 
 def ts_to_dt(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
+    return datetime.fromtimestamp(ts)
 
 
 def fmt_ts(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 def is_text(msg):
     return msg.get("type") == "text" and msg.get("content", "").strip()
-
-
-def negative_score(text):
-    return sum(1 for w in NEGATIVE_WORDS if w in text)
 
 
 # ──────────────────────────────────────────────
@@ -149,7 +140,7 @@ def filter_by_since(msgs, since_str):
     """筛选 since 日期之后的消息"""
     if not since_str:
         return msgs
-    since_dt = datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    since_dt = datetime.strptime(since_str, "%Y-%m-%d")
     since_ts = since_dt.timestamp()
     return [m for m in msgs if m["timestamp"] >= since_ts]
 
@@ -161,7 +152,7 @@ def find_conflict_window(text_msgs, window=100):
     best_score = -1
     best_start = 0
     for i in range(len(text_msgs) - window + 1):
-        score = sum(negative_score(m["content"]) for m in text_msgs[i:i + window])
+        score = sum(count_conflict(m["content"]) for m in text_msgs[i:i + window])
         if score > best_score:
             best_score = score
             best_start = i
@@ -184,21 +175,66 @@ def find_repair_moments(msgs, gap=GAP_THRESHOLD, post_count=20):
     return result
 
 
-def format_msg(m):
+def format_msg(m, annot=None):
+    """`annot` 是 `{local_id: (valence, arousal)}`；有就在行尾挂情绪坐标。
+
+    坐标由 `stats_analyzer.py --affect auto` 算出并写在旁车文件
+    `affect_messages.json` 里——本脚本**不自己加载模型**，保持零依赖。
+    没有旁车文件时原样输出，不报错、不降级提示。
+    """
     sender = "我" if m.get("sender") == "me" else "TA"
-    return f"[{fmt_ts(m['timestamp'])}] {sender}: {m.get('content', '').strip()}"
+    line = f"[{fmt_ts(m['timestamp'])}] {sender}: {m.get('content', '').strip()}"
+    if annot:
+        pt = annot.get(m.get("local_id"))
+        if pt:
+            line += f"  ⟨{pt[0]:+.2f}/{pt[1]:+.2f}⟩"
+
+    # 引用回复：把被引的那条也带出来。没有它，一问一答会看起来像答非所问。
+    quote = m.get("quote")
+    if quote:
+        who = {"me": "我", "them": "TA"}.get(quote.get("sender"), "?")
+        body = (quote.get("content") or "").strip()
+        if quote.get("source") == "refermsg":
+            # 来自 message_*.db 的 appmsg XML，是原文
+            nick = quote.get("display_name")
+            nick_txt = f"，微信昵称「{nick}」" if nick else ""
+            line += f"\n{' ' * 6}↳ 引用 {who}{nick_txt}：{body}"
+        else:
+            # FTS 不存被引原文，这里是按相邻消息重建的——必须标出来
+            gap = quote.get("gap_seconds")
+            gap_txt = f"，间隔 {gap // 60} 分钟" if isinstance(gap, int) else ""
+            line += f"\n{' ' * 6}↳ 〔推断〕引用 {who}{gap_txt}：{body}"
+    return line
 
 
-def write_window(f, title, msgs):
+def write_window(f, title, msgs, annot=None):
     f.write(f"\n{'='*60}\n")
     f.write(f"=== {title} ===\n")
     f.write(f"{'='*60}\n")
     for m in msgs:
-        f.write(format_msg(m) + "\n")
+        f.write(format_msg(m, annot) + "\n")
     f.write(f"\n（共 {len(msgs)} 条）\n")
 
 
-def build_generate(data, since_str, output_path):
+def load_annotations(input_path):
+    """读旁车文件 `affect_messages.json`（与 messages.json 同目录）。
+
+    没有就返回 None——**不报错、不提示、不降级显示**。情感层是可选的，
+    缺了只是少一个坐标，不是错误。
+    """
+    sidecar = os.path.join(os.path.dirname(os.path.abspath(input_path)),
+                           "affect_messages.json")
+    if not os.path.exists(sidecar):
+        return None
+    try:
+        with open(sidecar, encoding="utf-8") as f:
+            pts = json.load(f).get("points", [])
+        return {p["local_id"]: (p["v"], p["a"]) for p in pts}
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def build_generate(data, since_str, output_path, annot=None):
     msgs = data.get("messages", [])
     if not msgs:
         print(json.dumps({"error": "消息列表为空"}, ensure_ascii=False))
@@ -218,9 +254,11 @@ def build_generate(data, since_str, output_path):
     me_count = sum(1 for m in scoped if m.get("sender") == "me")
     them_count = sum(1 for m in scoped if m.get("sender") == "them")
 
-    # 最近 30 天
+    # 最近 30 天（取窗口内**最新**的 200 条；用 [:200] 会取到最旧的 200 条，
+    # 一旦窗口内文字消息 >200，最近的部分就被整段切掉——窗口名叫「最近 30 天」，
+    # 却系统性漏掉最近一周。见 memory: project-she-love-me-stats-fixes）
     recent_cutoff = last_ts - 30 * 86400
-    recent_msgs = [m for m in text_msgs if m["timestamp"] >= recent_cutoff][:200]
+    recent_msgs = [m for m in text_msgs if m["timestamp"] >= recent_cutoff][-200:]
 
     # 修复时刻
     repair_chunks = find_repair_moments(all_msgs)
@@ -239,18 +277,30 @@ def build_generate(data, since_str, output_path):
         f.write(f"发起占比: 我方 {me_count/total*100:.1f}% | 对方 {them_count/total*100:.1f}%\n")
         f.write("\n⚠️ 以下为分层采样关键窗口，不代表全量记录。\n")
         f.write("   统计层全量数据请参见 data/stats.json。\n")
+        if any(m.get("quote") for m in scoped):
+            f.write("\n带 ↳ 的行是被引用的原消息（引用回复）。两种来源，可信度不同：\n")
+            f.write("  ↳ 引用 …（无标记）  来自 message_*.db 的 appmsg XML，**是原文**\n")
+            f.write("  ↳ 〔推断〕引用 …    FTS 不存被引原文（message_1.db 无密钥），"
+                    "按「最近一条对方消息」重建，\n"
+                    "                      **是推断不是事实**，间隔越大越不可信，"
+                    "引用时须自行核对\n")
+        if annot:
+            f.write("\n每行结尾的 ⟨效价/唤醒⟩ 由情感计算层给出，取值 [-1, 1]：\n")
+            f.write("  效价  −1 极负 ←→ +1 极正      唤醒  −1 极平静 ←→ +1 极激动\n")
+            f.write("  ⚠️ 单条坐标只是一个坐标，不是判断。已知弱点：疲惫类表达偏中性"
+                    "（「好累啊」≈0），这类请以词面为准。\n")
 
         # 窗口 1：起源（最早 100 条文本）
         window1 = text_msgs[:100]
-        write_window(f, "窗口 1：关系起源（最早 100 条文字消息）", window1)
+        write_window(f, "窗口 1：关系起源（最早 100 条文字消息）", window1, annot)
 
         # 窗口 2：高冲突区间
         window2 = find_conflict_window(text_msgs, 100)
         w2_start = fmt_ts(window2[0]["timestamp"]) if window2 else "N/A"
-        write_window(f, f"窗口 2：高冲突区间（从 {w2_start} 起的 100 条）", window2)
+        write_window(f, f"窗口 2：高冲突区间（从 {w2_start} 起的 100 条）", window2, annot)
 
         # 窗口 3：最近 30 天
-        write_window(f, f"窗口 3：最近 30 天（最多 200 条文字消息）", recent_msgs)
+        write_window(f, f"窗口 3：最近 30 天（最多 200 条文字消息）", recent_msgs, annot)
 
         # 窗口 4：修复时刻
         if repair_chunks:
@@ -261,7 +311,7 @@ def build_generate(data, since_str, output_path):
                 gap_start = fmt_ts(chunk[0]["timestamp"])
                 f.write(f"\n--- 修复时刻 {idx}（{gap_start} 沉默后恢复）---\n")
                 for m in chunk:
-                    f.write(format_msg(m) + "\n")
+                    f.write(format_msg(m, annot) + "\n")
             total_gaps = len(repair_chunks)
             if total_gaps > 10:
                 f.write(f"\n（共识别 {total_gaps} 次沉默-修复事件，展示前 10 次）\n")
@@ -308,7 +358,7 @@ def main():
     if args.preview:
         build_preview(data)
     elif args.output:
-        build_generate(data, args.since, args.output)
+        build_generate(data, args.since, args.output, load_annotations(args.input))
     else:
         parser.error("请指定 --preview 或 --output")
 

@@ -22,35 +22,25 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from lexicon import (
+    dismissive_form,
+    is_goodnight,
+    count_hedging,
+    count_conditional,
+    count_positive,
+    count_negative,
+)
+# 口径常量集中在 metrics_defs —— 历史教训：同一个指标两套口径会让报告里的数
+# 和代码算的数分叉，而更正只能靠人手写进散文。三套会话口径都存，谁用哪套写明。
+from metrics_defs import SESSION_GAPS, session_starts, COLD_WAR_GAP
+
 # Windows 控制台 UTF-8 输出
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-# 冷淡回复词库
-COLD_WORDS = {"嗯", "哦", "好", "行", "哦哦", "嗯嗯", "好的", "ok", "OK", "好吧",
-              "随便", "可以", "知道了", "知道", "哈", "哈哈", "em", "em...", "emmm"}
-
-# 早安/晚安关键词
-GOODNIGHT_WORDS = {"晚安", "good night", "goodnight", "晚安啦", "晚安嗷", "晚安哦"}
-GOODMORNING_WORDS = {"早安", "早上好", "早啊", "早哦", "good morning", "早", "早起了"}
-
 # 对话间隔阈值（秒）: 超过此时间视为新对话开始
 NEW_CONVERSATION_GAP = 3 * 3600  # 3小时
-
-# 语言学词库
-HEDGING_WORDS = ["也许", "可能", "感觉", "好像", "大概", "应该", "似乎", "觉得", "不确定", "说不定"]
-CONDITIONAL_MARKERS = ["如果", "要是", "假如", "万一", "要不然", "若是", "倘若"]
-POSITIVE_EMOTION_WORDS = [
-    "开心", "高兴", "快乐", "幸福", "爱", "喜欢", "想你", "好想", "哈哈", "嘻嘻",
-    "棒", "好棒", "厉害", "可爱", "美", "帅", "甜", "暖", "温柔", "期待",
-    "谢谢", "感谢", "宝贝", "亲爱", "老公", "老婆", "宝宝"
-]
-NEGATIVE_EMOTION_WORDS = [
-    "烦", "累", "难过", "伤心", "痛苦", "委屈", "生气", "愤怒", "失望", "绝望",
-    "算了", "无所谓", "随便", "不想", "放弃", "好累", "心累", "难受", "伤", "哭"
-]
-
 
 def load_messages(path):
     # Accept UTF-8 with or without BOM because Windows editors often save JSON with BOM.
@@ -157,9 +147,10 @@ def detect_cold_replies(text_messages):
 
     for msg in text_messages:
         content = msg["content"].strip()
-        is_cold = content in COLD_WORDS or len(content) <= 2
-        if is_cold:
-            cold_word_count[content] += 1
+        # 归一化后整条等于白名单才算敷衍——不再拿长度兜底
+        form = dismissive_form(content)
+        if form is not None:
+            cold_word_count[form] += 1
             if msg["sender"] == "me":
                 my_cold += 1
             else:
@@ -204,14 +195,73 @@ def detect_goodnight(text_messages):
     their_goodnight = 0
 
     for msg in text_messages:
-        content = msg["content"].lower().strip()
-        if any(w in content for w in GOODNIGHT_WORDS):
+        if is_goodnight(msg["content"]):
             if msg["sender"] == "me":
                 my_goodnight += 1
             else:
                 their_goodnight += 1
 
     return {"my_goodnight": my_goodnight, "their_goodnight": their_goodnight}
+
+
+def detect_turn_response(text_messages, gap=3 * 3600):
+    """burst 对 burst 的「回了多少」。
+
+    把「一个人连续说的若干条」当一个单位（burst），看对方**整段**回了多少字。
+    相比逐条统计，这样「连发 5 条 → 回 1 条」算**一个**样本，不会被拆成 5 个
+    （拆开的话其中 4 个会被判成应答，数字完全是假的）。
+
+    ⚠️ 它是一个**代理**，不是「投入度」本身。实测它和人工标注的「投入 / 应答」
+    高度共线（AUC 0.893）——所以它和那个标签分享同样的方差，**不能用它去验证
+    标签**，只能当一条独立的描述性指标。
+
+    另一条实测结论：**对方说了多少，对本方回多少几乎没有预测力**（对方侧特征
+    AUC 0.46–0.55）。所以两个方向可以直接比——不存在「他发的废话多、所以她回得
+    少」那种分母问题。
+    """
+    if not text_messages:
+        return None
+    # burst：同人、相邻两条间隔 <= gap
+    bursts = []
+    i = 0
+    while i < len(text_messages):
+        j = i
+        while (j + 1 < len(text_messages)
+               and text_messages[j + 1]["sender"] == text_messages[i]["sender"]
+               and text_messages[j + 1]["timestamp"] - text_messages[j]["timestamp"] <= gap):
+            j += 1
+        bursts.append((i, j, text_messages[i]["sender"], text_messages[i]["timestamp"]))
+        i = j + 1
+
+    out = {}
+    for who, label in (("me", "them_to_me"), ("them", "me_to_them")):
+        # A 是 who，统计 B 那一段的总字数
+        lens = []
+        for k in range(len(bursts) - 1):
+            a, b = bursts[k], bursts[k + 1]
+            if a[2] != who or b[2] == who:
+                continue
+            # 同一轮对话（间隔不超过 gap）才算回应
+            if text_messages[b[0]]["timestamp"] - text_messages[a[1]]["timestamp"] > gap:
+                continue
+            lens.append(sum(len(text_messages[t]["content"]) for t in range(b[0], b[1] + 1)))
+        if not lens:
+            out[label] = None
+            continue
+        s = sorted(lens)
+        out[label] = {
+            "n": len(s),
+            "median_chars": s[len(s) // 2],
+            "mean_chars": round(sum(s) / len(s), 1),
+            "p25_chars": s[len(s) // 4],
+            "p75_chars": s[(3 * len(s)) // 4],
+        }
+    out["definition"] = ("burst 对 burst：A 连续若干条 → B 连续若干条，统计 B 那一段的总字数。"
+                         "「连发 N 条 → 回 1 条」算一个样本。")
+    out["caveat"] = ("这是**代理**不是「投入度」。它与人工标注的投入/应答高度共线"
+                     "（AUC 0.893），因此不能用来验证那个标签。跨方向可直接比——"
+                     "实测对方说了多少对本方回多少几乎无预测力。")
+    return out
 
 
 def analyze_linguistics(text_messages, all_messages):
@@ -238,15 +288,10 @@ def analyze_linguistics(text_messages, all_messages):
         i_count = content.count("我") - we_count * 2  # 排除"我们"中的"我"
         i_count = max(i_count, 0)
 
-        # 模糊词统计
-        hedging_count = sum(1 for w in HEDGING_WORDS if w in content)
-
-        # 条件句统计
-        conditional_count = sum(1 for w in CONDITIONAL_MARKERS if w in content)
-
-        # 情绪词统计
-        pos_count = sum(1 for w in POSITIVE_EMOTION_WORDS if w in content)
-        neg_count = sum(1 for w in NEGATIVE_EMOTION_WORDS if w in content)
+        hedging_count = count_hedging(content)
+        conditional_count = count_conditional(content)
+        pos_count = count_positive(content)
+        neg_count = count_negative(content)
 
         if sender == "me":
             my_we += we_count
@@ -270,8 +315,10 @@ def analyze_linguistics(text_messages, all_messages):
     # 计算情绪正向比率（正向词 / 总情绪词）
     my_total_emotion = my_positive + my_negative
     their_total_emotion = their_positive + their_negative
-    my_pos_ratio = round(my_positive / my_total_emotion, 3) if my_total_emotion > 0 else 0.5
-    their_pos_ratio = round(their_positive / their_total_emotion, 3) if their_total_emotion > 0 else 0.5
+    # 分母为 0 时输出 None（JSON null），不再兜底 0.5——0.5 是一个从未被测量过的
+    # 「中性」，会被下游当成真实观测值去推导 Gottman 比值。
+    my_pos_ratio = round(my_positive / my_total_emotion, 3) if my_total_emotion > 0 else None
+    their_pos_ratio = round(their_positive / their_total_emotion, 3) if their_total_emotion > 0 else None
 
     return {
         "pronoun_we_count": {"me": my_we, "them": their_we},
@@ -394,10 +441,111 @@ def fmt_duration(seconds):
     return f"{seconds / 3600:.1f} 小时"
 
 
+# ---------------------------------------------------------------- 情感计算层
+
+AFFECT_MIN_MESSAGES = 50
+
+# 只用作「还没导入 embed_hf 时」的占位标签。真正的模型标识一律取自
+# `embed_hf.DEFAULT_MODEL`（单一来源），不要在这里另立一份——曾经把显示标签
+# 当成仓库 id 传进 `cached()`，导致它在磁盘上找一个不存在的目录、一路判成
+# 「无缓存」。那个 bug 只在 `--no-download` 路径上暴露；环境里有缓存的机器
+# 永远发现不了它。
+AFFECT_FALLBACK_MODEL = "onnx-community/bge-small-zh-v1.5-ONNX"
+
+
+def build_affect(messages, args):
+    """构建 stats.json 的 `affect` 段。定义见 `references/affect-schema.md`。
+
+    **这个 key 永远存在**，不可用时也只是 `status != "ok"`——消费方判 status，
+    不判 key 在不在。
+
+    **任何降级路径都返回一个 dict，绝不抛异常、绝不 sys.exit。** 情感层是可选增强，
+    不能因为环境缺件就中断主分析；所有路径都必须 exit 0。
+
+    status 语义：`disabled` = 一开始就没打算算；`degraded` = 试了但没成。
+    区别只在诊断价值——`degraded` 说明环境本来是够的，值得看一眼。
+    """
+    import affect_schema
+
+    # ⚠️ 本函数统一返回 `(affect 段, 逐条坐标或 None)`。**所有** return 都必须
+    # 走这两个包装——曾经只改了最后那个 return，于是 `--affect off` 这条路径返回
+    # 裸 dict，调用处解包时炸成 "too many values to unpack"。那条路径在改动之后
+    # 再没被测过，一直到手动跑一次才暴露。
+    def shell(reason, status="disabled", model=AFFECT_FALLBACK_MODEL):
+        return affect_schema.shell(status=status, reason=reason, model=model), None
+
+    if args.affect == "off":
+        return shell("未启用（--affect off）")
+
+    try:
+        import embed_hf
+    except Exception as exc:  # 连模块都进不来（缺 numpy 等）
+        return shell(f"无法导入 embed_hf：{type(exc).__name__}: {exc}")
+
+    # 到这里起，模型标识只有一个来源
+    model_id = args.affect_model or embed_hf.DEFAULT_MODEL
+
+    def stop(reason, status="disabled"):
+        return shell(reason, status=status, model=model_id)
+
+    text_msgs = [m for m in messages
+                 if m.get("type") == "text" and m.get("content", "").strip()]
+    if len(text_msgs) < AFFECT_MIN_MESSAGES:
+        return stop(f"文字消息不足 {AFFECT_MIN_MESSAGES} 条（实际 {len(text_msgs)}）")
+
+    ok, why = embed_hf.available()
+    if not ok:
+        return stop(why)
+
+    cache = args.model_cache or embed_hf.DEFAULT_CACHE_DIR
+    if not embed_hf.cached(model_id, cache_dir=cache) and args.no_download:
+        return stop(f"本地无模型缓存（{cache}），且指定了 --no-download")
+
+    try:
+        session, tokenizer = embed_hf.load(
+            model_id, cache_dir=cache, endpoint=args.hf_endpoint,
+            allow_download=not args.no_download)
+        import affect
+        import semantic_features
+
+        def embed_fn(texts):
+            return embed_hf._embed(texts, session, tokenizer)
+
+        result = affect.analyze(messages, embed_fn, model=model_id, return_points=True)
+        if result.get("status") == "ok":
+            # 语义层复用同一个 session，不重复加载模型
+            try:
+                result["semantics"] = semantic_features.analyze(messages, embed_fn)
+            except Exception as exc:
+                result["semantics"] = {
+                    "degraded_reason": f"{type(exc).__name__}: {exc}"}
+        # 逐条坐标不进 stats.json（1105 条太大），取出来由 main() 写旁车文件
+        points = result.pop("_points", None)
+        return result, points
+    except Exception as exc:
+        # 注意 `stop()` 自己已经返回 `(段, None)` 了——这里**不要**再补一个 `, None`，
+        # 否则会变成嵌套元组，写进 JSON 就是 "[{...}, null]" 这种列表。
+        return stop(f"模型加载失败：{type(exc).__name__}: {exc}", status="degraded")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--affect", choices=("off", "auto"), default="off",
+        help="情感计算层（默认 off：零依赖、零联网）。"
+             "auto = 尝试启用；任何环节不可用则降级，且始终 exit 0。"
+             "降级表见 references/affect-schema.md。")
+    parser.add_argument("--affect-model", default=None,
+                        help=f"覆盖默认句向量模型（默认 {AFFECT_FALLBACK_MODEL}）")
+    parser.add_argument("--model-cache", default=None,
+                        help="模型缓存目录（默认 vendor/hf_cache，已 gitignore）")
+    parser.add_argument("--no-download", action="store_true",
+                        help="只用本地缓存的模型，绝不联网")
+    parser.add_argument("--hf-endpoint", default=None,
+                        help="自定义模型下载源。默认官方 HF，不可达时自动回退 "
+                             "hf-mirror.com。⚠️ 非官方镜像的权重可信度由使用者自负。")
     args = parser.parse_args()
 
     data = load_messages(args.input)
@@ -451,6 +599,9 @@ def main():
     # 语言学特征
     linguistics = analyze_linguistics(text_msgs, valid)
 
+    # 轮次级回应的字数（零依赖，与 affect 层无关）
+    turn_response = detect_turn_response(text_msgs)
+
     # 活跃时段
     active_hours = defaultdict(int)
     for m in valid:
@@ -470,6 +621,65 @@ def main():
     for m in valid:
         type_counts[m["type"]][m["sender"]] += 1
 
+    # ---- C 模块的量化条件（risk-signals.md 双阈值里「量化」的那一半）
+    # 只增不改：既有指标一律不动。
+    # 每项都带来源 / 可用性。宁可显式标 unavailable，也不要算一个和人工结论冲突
+    # 的数 ——「撤回」那项就是这么坑的：代码按 local_type 数，结构性恒为 0，
+    # 而人工口径是「他 7 / 她 3」。让规则层能看出「这个数不能用」。
+    # 消息基数也是一个口径：`valid` 只含 sender ∈ {me, them}（1531 条），
+    # 全部消息含 system/unknown（1541 条）。删掉系统消息会让会话切得更碎 ——
+    # 实测 h6 在 valid 上是 他40/她7，在 all 上是 他39/她7。
+    # 人工结论用的是 all。两套都存，别挑一个装作只有一个。
+    _bases = {"valid": valid, "all": messages}
+    c_session = {}
+    for _name, _gap in SESSION_GAPS.items():
+        _per_basis = {}
+        for _bname, _msgs in _bases.items():
+            _s = session_starts(_msgs, _gap)
+            _per_basis[_bname] = {
+                "me_starts": _s["me"],
+                "them_starts": _s["them"],
+                "total_sessions": _s["total"],
+                "source": "会话切分 gap=%ds，消息基数=%s" % (_gap, _bname),
+            }
+        # 顶层键保留 all 口径（与人工结论一致），valid 放旁边备查。
+        c_session[_name] = dict(_per_basis["all"])
+        c_session[_name]["by_basis"] = _per_basis
+
+    _ts = sorted(m["timestamp"] for m in valid if m.get("timestamp"))
+    _cold_war = sum(1 for i in range(1, len(_ts)) if _ts[i] - _ts[i - 1] > COLD_WAR_GAP)
+    _last30 = (_ts[-1] - 30 * 86400) if _ts else 0
+    _s30 = session_starts([m for m in valid if (m.get("timestamp") or 0) >= _last30],
+                          SESSION_GAPS["h6"])
+
+    c_metrics = {
+        "session_gaps": c_session,
+        "cold_war_count": {
+            "value": _cold_war,
+            "source": "相邻消息间隔 > %ds" % COLD_WAR_GAP,
+        },
+        "starts_30d": {
+            "me": _s30["me"],
+            "them": _s30["them"],
+            "source": "近 30 天，会话切分 gap=h6",
+        },
+        # 以下三项 stats.json 拿不到 —— 显式标 unavailable，
+        # 让规则层宁可不出结论，也不要拿一个 0 当真值。
+        "revoke_by_sender": {
+            "available": False,
+            "reason": "linguistic.revoke_count 按 type=='revoke' 统计，而该类型早已"
+                      "不产生、结构性恒为 0；真实撤回要从 sysmsg 解析",
+        },
+        "future_statements": {
+            "available": False,
+            "reason": "conditional_count 是条件句，不是未来指向句",
+        },
+        "gottman_by_phase": {
+            "available": False,
+            "reason": "正负比只有全程总值，没有分期",
+        },
+    }
+
     stats = {
         "contact": contact_display,
         "basic": {
@@ -487,6 +697,8 @@ def main():
             "their_starts": their_starts,
             "my_start_ratio": round(my_starts / max(my_starts + their_starts, 1), 3),
         },
+        # 只增不改：上面的 initiative 保持原口径（h3），c_metrics 里另存三套。
+        "c_metrics": c_metrics,
         "reply_speed": {
             "my_avg_seconds": round(avg_my_reply),
             "their_avg_seconds": round(avg_their_reply),
@@ -506,6 +718,7 @@ def main():
         "daily_trend": daily_trend,
         "message_types": {k: dict(v) for k, v in type_counts.items()},
         "linguistic": linguistics,
+        "turn_response": turn_response,
     }
 
     stats["scores"] = compute_scores(stats)
@@ -580,9 +793,22 @@ def main():
     else:
         stats["recent_30d"] = None
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    # 情感计算层（可选）。始终写入 `affect` 这个 key——不可用时 status="disabled"。
+    affect_section, affect_points = build_affect(messages, args)
+    stats["affect"] = affect_section
+
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    os.makedirs(out_dir, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    # 逐条情绪坐标写旁车文件——`build_chat_history.py` 读它给每行挂坐标，
+    # 这样那一步不用自己再加载一次模型（保持零依赖）。
+    if affect_points:
+        with open(os.path.join(out_dir, "affect_messages.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": affect_section.get("version"),
+                       "model": affect_section.get("model"),
+                       "points": affect_points}, f, ensure_ascii=False)
 
     s = stats["scores"]
     print(f"[+] 分析完成: 主动={s['simp_index']} 被爱={s['loved_index']} 冷淡={s['cold_index']}", file=sys.stderr)

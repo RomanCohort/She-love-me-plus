@@ -7,6 +7,15 @@ traditional-deployment/output/
 *.json.bak
 all_keys.json
 
+# 个人分析产物（含真实对话原文与分类结果），绝不入库
+analysis/
+data/live/
+
+# 导出物 / 临时文件
+*.pdf
+*.csv
+*.xlsx
+
 # Python
 __pycache__/
 *.py[cod]

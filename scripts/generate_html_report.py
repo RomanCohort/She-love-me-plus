@@ -34,12 +34,21 @@ def build_chart_data(stats):
     basic = stats.get("basic", {})
     pie_data = [basic.get("my_messages", 0), basic.get("their_messages", 0)]
 
+    # 情感计算层（可选）。**只在 status == "ok" 且有数据时才画**——
+    # 缺了就整块不出现，不是画一条空线。
+    affect = stats.get("affect") or {}
+    dv = (affect.get("daily_valence") or []) if affect.get("status") == "ok" else []
+
     return {
         "trend_labels": trend_labels,
         "trend_data": trend_data,
         "hour_labels": hour_labels,
         "hour_data": hour_data,
         "pie_data": pie_data,
+        "has_valence": bool(dv),
+        "valence_labels": [d["date"] for d in dv],
+        "valence_me": [d.get("me") for d in dv],
+        "valence_them": [d.get("them") for d in dv],
     }
 
 
@@ -47,6 +56,90 @@ def escape_html(s):
     if not isinstance(s, str):
         s = str(s)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def unwrap(v, default=""):
+    """字段可能是裸标量，也可能是 {value, evidence_level, reason} 包装对象。
+
+    真实数据里两种都存在：`advancement_path` 和 `partner_attachment` 是包装对象，
+    其余是裸值。而 escape_html 会把整个 dict 的 repr 直接打进报告 —— 报告里
+    真的出现过 `{'value': '安全型（偏自主／低主动）', 'evidence_level': 'medium', ...}`。
+    这里统一取 `value`；value 为 None 时退回 `reason`（那正是「有理由没结论」的意思）。
+    写法照抄 render_patriarch_wisdom 里 fatal_mistake 的既有处理。
+    """
+    if isinstance(v, dict):
+        return v.get("value") or v.get("reason") or default
+    return default if v is None else v
+
+
+def enum_key(v, allowed):
+    """从可能被散文污染的枚举槽里取出枚举成员，取不到返回 None。
+
+    模型经常往枚举槽里写「逐渐降温（自 09-25 线下见面峰值回落…）」这种，
+    于是精确匹配失败、报告静默掉进灰色兜底（实测 4 处）。精确匹配失败时
+    退一步取第一个分隔符之前的部分再试。散文本身照常显示，只是配色不再丢。
+    """
+    if not isinstance(v, str):
+        return None
+    if v in allowed:
+        return v
+    head = re.split(r"[（(·\s—\-]", v, maxsplit=1)[0].strip()
+    return head if head in allowed else None
+
+
+# ── 受控词表（对应 references/intent-taxonomy.md）──────────────────────────
+# 这里刻意用**双引号字面量**：analysis_contract.check_renderer_sync() 靠字符串
+# 搜索做漂移校验，常量定义在模块级才能被它看到。
+# 词表是「推荐值域，不是硬校验」——消费方容忍表外值，走灰色兜底。
+INTENT_LABELS = (
+    "分享近况", "回答问题", "告知信息", "询问信息", "确认理解", "解释说明",
+    "学术讨论", "表达观点", "表示认同", "表达异议", "回应收到", "其他意图",
+    "延续话题", "转移话题", "玩笑逗趣", "缓和气氛", "结束聊天",
+    "倾诉烦恼", "寻求安慰", "寻求认同", "安慰支持", "表达关心", "请求帮助",
+    "提供建议", "赞美欣赏", "表达感谢", "道歉修复",
+    "寻求关注", "试探好感", "试探邀约", "发出邀约", "暧昧逗弄", "表达在意",
+    "婉拒提议", "表达边界", "难以判断",
+)
+EMOTION_VOCAB = (
+    "开心", "疑惑", "愤怒", "难过", "害羞", "关心",
+    "调侃", "平静", "不耐烦", "惊讶", "失落", "难判断",
+)
+MOMENT_KINDS = (
+    "拒绝 / 划清界限", "重新靠近", "邀约", "确认安排", "取消安排", "关心",
+    "说出喜好", "敞开心扉", "表达心意", "提问", "澄清",
+)
+# 实时标注层用英文 kebab（boundary / reopen / invitation …），批量分析层用中文标签。
+# 两套表示指向同一个概念，这里做归一，避免同一个 kind 在两侧渲染成两个东西。
+MOMENT_KIND_ALIASES = {
+    "boundary": "拒绝 / 划清界限", "reopen": "重新靠近", "invitation": "邀约",
+    "confirmation": "确认安排", "cancellation": "取消安排", "care": "关心",
+    "preference": "说出喜好", "disclosure": "敞开心扉", "commitment": "表达心意",
+    "question": "提问", "correction": "澄清",
+}
+# 次要时刻：默认不进时间线主视图，避免把「关系里程碑」淹没在「今天问了道题」里
+MOMENT_MINOR = ("提问", "澄清", "说出喜好")
+GRADES = ("SSS", "SS", "S", "A", "B", "C", "D")
+AFFINITY_DIMS = ("主动延续", "回应投入", "关心体贴", "自我开放", "亲密表达", "实际行动")
+
+GRADE_COLORS = {
+    "SSS": "#ec4899", "SS": "#a855f7", "S": "#22c55e", "A": "#3b82f6",
+    "B": "#eab308", "C": "#f97316", "D": "#ef4444",
+}
+MOMENT_KIND_COLORS = {
+    "拒绝 / 划清界限": "#ef4444", "重新靠近": "#22c55e", "邀约": "#3b82f6",
+    "确认安排": "#06b6d4", "取消安排": "#f97316", "关心": "#ec4899",
+    "说出喜好": "#8b5cf6", "敞开心扉": "#a855f7", "表达心意": "#f43f5e",
+    "提问": "#6b7280", "澄清": "#6b7280",
+}
+
+
+def safe_int(v, default=0):
+    """数值槽防呆。render_sternberg 是裸插值 `{passion}%`——模型给个字符串就崩。
+    affinity 的档位/权重全走这里。"""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
 
 
 def render_danger_warnings(danger_warnings):
@@ -94,6 +187,8 @@ def render_danger_warnings(danger_warnings):
 
 
 def render_sternberg(sternberg):
+    if not sternberg:
+        return ""
     passion    = sternberg.get("passion", 0)
     intimacy   = sternberg.get("intimacy", 0)
     commitment = sternberg.get("commitment", 0)
@@ -120,6 +215,8 @@ def render_sternberg(sternberg):
 
 
 def render_gottman(gottman):
+    if not gottman:
+        return ""
     ratio    = gottman.get("positive_negative_ratio", 0)
     horsemen = gottman.get("horsemen_detected", [])
     risk     = escape_html(gottman.get("risk_level", ""))
@@ -169,8 +266,12 @@ def render_gottman(gottman):
 
 
 def render_personality(personality, contact_name):
-    user_att    = escape_html(personality.get("user_attachment", ""))
-    partner_att = escape_html(personality.get("partner_attachment", ""))
+    if not personality:
+        return ""
+    # 这两个槽真实数据里是 {value, evidence_level, reason} 包装对象，
+    # 直接 escape_html 会把 dict 的 repr 打进表格单元格。
+    user_att    = escape_html(unwrap(personality.get("user_attachment", "")))
+    partner_att = escape_html(unwrap(personality.get("partner_attachment", "")))
     user_comm   = escape_html(personality.get("user_communication", ""))
     partner_comm = escape_html(personality.get("partner_communication", ""))
     user_lang   = escape_html(personality.get("user_love_language", ""))
@@ -207,7 +308,8 @@ def render_personality(personality, contact_name):
         ea_level = ea.get("level", "")
         ea_evidence = escape_html(ea.get("evidence", ""))
         ea_risk = escape_html(ea.get("risk_note", ""))
-        ea_color = {"高": "#22c55e", "中": "#eab308", "低": "#ef4444"}.get(ea_level, "#6b7280")
+        ea_color = {"高": "#22c55e", "中": "#eab308", "低": "#ef4444"}.get(
+            enum_key(ea_level, ("高", "中", "低")), "#6b7280")
         ea_html = f"""
       <div class="ea-card">
         <div class="ea-header">
@@ -254,6 +356,8 @@ def render_personality(personality, contact_name):
 
 
 def render_strategist(strategist):
+    if not strategist:
+        return ""
     core    = escape_html(strategist.get("core_problem", ""))
     stops   = strategist.get("stop_doing", [])
     starts  = strategist.get("start_doing", [])
@@ -349,6 +453,242 @@ def render_key_findings(key_findings):
     return "\n".join(items)
 
 
+def render_intent_profile(intent_profile):
+    """渲染对话动作分类（意图分布）。词表见 references/intent-taxonomy.md。"""
+    if not intent_profile:
+        return ""
+    cats = [c for c in (intent_profile.get("categories") or [])
+            if isinstance(c, dict) and c.get("intent")]
+    if not cats:
+        return ""
+    cats.sort(key=lambda c: safe_int(c.get("me", 0)) + safe_int(c.get("them", 0)), reverse=True)
+
+    rows = []
+    for c in cats:
+        label = escape_html(enum_key(c["intent"], INTENT_LABELS) or c["intent"])
+        rows.append(f"""
+      <div class="pt-row">
+        <div class="pt-cell pt-label">{label}</div>
+        <div class="pt-cell pt-you">{safe_int(c.get("me", 0))}</div>
+        <div class="pt-cell pt-them">{safe_int(c.get("them", 0))}</div>
+      </div>""")
+
+    evidence_html = ""
+    for c in cats:
+        ev = [e for e in (c.get("evidence") or []) if isinstance(e, dict) and e.get("quote")]
+        if not ev:
+            continue
+        label = escape_html(enum_key(c["intent"], INTENT_LABELS) or c["intent"])
+        quotes = "".join(
+            f'<blockquote class="finding-quote">「{escape_html(e["quote"])}」'
+            f'<span class="intent-ev-date">{escape_html(e.get("date", ""))}</span></blockquote>'
+            for e in ev
+        )
+        evidence_html += f"""
+      <div class="intent-ev">
+        <div class="intent-ev-title">{label}</div>
+        {quotes}
+      </div>"""
+
+    coverage = escape_html(intent_profile.get("coverage", "") or "")
+    caveat   = escape_html(intent_profile.get("caveat", "") or "")
+    caveat_line = ""
+    if coverage or caveat:
+        txt = f"归类覆盖：{coverage or '—'}"
+        if caveat:
+            txt += f" —— {caveat}"
+        caveat_line = f'<p class="intent-caveat">{txt}</p>'
+
+    return f"""
+    <div class="intent-wrap">
+      <div class="personality-table">
+        <div class="pt-row pt-header">
+          <div class="pt-cell">意图</div>
+          <div class="pt-cell">你</div>
+          <div class="pt-cell">TA</div>
+        </div>
+        {''.join(rows)}
+      </div>
+      {caveat_line}
+      {evidence_html}
+    </div>"""
+
+
+def render_affinity(affinity):
+    """渲染六维好感度（对方一侧）。
+
+    与 render_emotional_asymmetry 的 symmetry_score 是**两个正交轴**：
+    那个量「双方对不对等」，这个量「TA 喜不喜欢你」。分开呈现，不得互相替代。
+    """
+    if not affinity:
+        return ""
+    by_key = {}
+    for d in (affinity.get("dimensions") or []):
+        if isinstance(d, dict) and d.get("key"):
+            by_key[str(d["key"]).strip()] = d
+
+    # 按 AFFINITY_DIMS 的规范顺序遍历——缺的维度显示「—」，不让它静默消失
+    rows = []
+    for name in AFFINITY_DIMS:
+        d = by_key.get(name) or {}
+        raw = d.get("score")
+        has_score = raw is not None
+        score  = safe_int(raw, 0)
+        weight = safe_int(d.get("weight", 0))
+        basis  = d.get("basis") or ""
+        level  = d.get("level")
+        el     = d.get("evidence_level") or ""
+
+        color = "#6b7280" if not has_score else (
+            "#22c55e" if score >= 66 else ("#eab308" if score >= 33 else "#ef4444"))
+        meta = " · ".join(x for x in (
+            f"档{level}" if level is not None else "",
+            {"quant": "量化", "text": "文本", "mixed": "量化+文本"}.get(basis, basis),
+            el,
+        ) if x)
+        note  = escape_html(d.get("note", "") or "")
+        # 分数怎么来的——`basis: quant` 时必须写明字段与口径，这是本量表的核心纪律，
+        # 不渲染出来等于把纪律留在了 JSON 里（scoring-rubrics.md 1.4 / 1.5）。
+        deriv = escape_html(d.get("derivation", "") or "")
+
+        meta_html  = f'<span class="affinity-meta">{escape_html(meta)}</span>' if meta else ''
+        deriv_html = f'<p class="affinity-deriv">↳ {deriv}</p>' if deriv else ''
+        note_html  = f'<p class="affinity-note">{note}</p>' if note else ''
+        val_txt    = score if has_score else "—"
+
+        rows.append(f"""
+      <div class="affinity-row">
+        <span class="affinity-label">{escape_html(name)}<span class="affinity-weight">w{weight}</span></span>
+        <div class="affinity-track"><div class="affinity-fill" style="width:{score if has_score else 0}%;background:{color};"></div></div>
+        <span class="affinity-val" style="color:{color}">{val_txt}</span>
+        {meta_html}
+        {deriv_html}
+        {note_html}
+      </div>""")
+
+    total = affinity.get("total")
+    if total is not None:
+        t = safe_int(total, 0)
+        t_color = "#22c55e" if t >= 66 else ("#eab308" if t >= 33 else "#ef4444")
+        total_html = f'<div class="affinity-total">总好感度 <b style="color:{t_color}">{t}</b> / 100</div>'
+    else:
+        reason = escape_html(affinity.get("total_reason", "") or "")
+        total_html = ('<div class="affinity-total affinity-total-na">总分未出 —— '
+                      + (reason or "有效维度不足 4 维") + '</div>')
+
+    boundary_html = ""
+    if affinity.get("boundary_applied"):
+        reason = escape_html(affinity.get("boundary_reason", "") or "")
+        boundary_html = ('<div class="situ-badge">⚠️ 边界封顶 · 总分已封顶 25'
+                         + (f' —— {reason}' if reason else '') + '</div>')
+
+    note = escape_html(affinity.get("total_note", "") or "")
+    return f"""
+    <div class="affinity-wrap">
+      {boundary_html}
+      {''.join(rows)}
+      {total_html}
+      {f'<p class="affinity-note">{note}</p>' if note else ''}
+    </div>"""
+
+
+def render_moments(moments):
+    """渲染关键时刻时间线。kind 归一化 + 次要时刻淡化。"""
+    if not moments:
+        return ""
+    items = []
+    for m in moments:
+        if not isinstance(m, dict):
+            continue
+        raw_kind = str(m.get("kind", "") or "").strip()
+        kind = MOMENT_KIND_ALIASES.get(raw_kind, raw_kind)
+        kind_label = enum_key(kind, MOMENT_KINDS) or kind
+        if not kind_label:
+            continue
+        minor = kind_label in MOMENT_MINOR
+        k_color = MOMENT_KIND_COLORS.get(kind_label, "#6b7280")
+
+        sender = "你" if m.get("sender") == "me" else "TA"
+        s_cls = "pt-you" if m.get("sender") == "me" else "pt-them"
+        status = str(m.get("status", "") or "")
+        status_label = {"active": "有效", "resolved": "已消解", "uncertain": "存疑"}.get(status, "")
+        quote = escape_html(m.get("quote", "") or "")
+        resolution = escape_html(m.get("resolution", "") or "")
+        date = escape_html(m.get("date", "") or "")
+        title = escape_html(m.get("title", "") or "")
+
+        # 注意：不要在 f-string 的表达式里嵌套引号——Python <3.12 会直接 SyntaxError。
+        # 这里把每个条件片段先算成变量，模板里只做插值。
+        status_html  = f'<span class="moment-status">{status_label}</span>' if status_label else ''
+        title_html   = f'<div class="moment-title">{title}</div>' if title else ''
+        quote_html   = f'<blockquote class="finding-quote">「{quote}」</blockquote>' if quote else ''
+        res_html     = f'<p class="moment-resolution">↳ {resolution}</p>' if resolution else ''
+        minor_cls    = ' moment-minor' if minor else ''
+
+        items.append(f"""
+      <div class="moment-item{minor_cls}">
+        <div class="moment-head">
+          <span class="moment-date">{date}</span>
+          <span class="moment-kind" style="color:{k_color};border-color:{k_color}44;background:{k_color}14;">{escape_html(kind_label)}</span>
+          <span class="moment-sender {s_cls}">{sender}</span>
+          {status_html}
+        </div>
+        {title_html}
+        {quote_html}
+        {res_html}
+      </div>""")
+    if not items:
+        return ""
+    return f'<div class="moments-list">{"".join(items)}</div>'
+
+
+def render_reply_grades(reply_grades):
+    """渲染回复评分（只评用户自己的消息）。量表见 references/scoring-rubrics.md。"""
+    if not reply_grades:
+        return ""
+    items = []
+    for i, g in enumerate(reply_grades):
+        if not isinstance(g, dict):
+            continue
+        grade = str(g.get("grade", "") or "").strip()
+        g_key = enum_key(grade, GRADES)
+        g_color = GRADE_COLORS.get(g_key, "#6b7280") if g_key else "#6b7280"
+        score = g.get("score")
+        score_txt = f" · {safe_int(score)}" if score is not None else ""
+        ctx = escape_html(g.get("context", "") or "")
+        reason = escape_html(g.get("reason", "") or "")
+        alts = [a for a in (g.get("alternatives") or []) if a]
+        alts_html = "".join(
+            f'<div class="strategy-script">「{escape_html(a)}」</div>' for a in alts)
+        if not alts:
+            alts_html = '<div class="strategy-script" style="color:var(--text-subtle)">（未给替代表达）</div>'
+
+        grade_txt = escape_html(grade or "—")
+        date_txt  = escape_html(g.get("date", "") or "")
+        gq        = escape_html(g.get("quote", "") or "")
+        # 先算片段再插值：f-string 表达式里不嵌套引号（Python <3.12 会 SyntaxError）
+        quote_html = f'<blockquote class="finding-quote">「{gq}」</blockquote>' if gq else ''
+        ctx_html   = f'<p class="grade-ctx">语境：{ctx}</p>' if ctx else ''
+        rsn_html   = f'<p class="finding-analysis">{reason}</p>' if reason else ''
+        date_html  = f'<span class="grade-date">{date_txt}</span>' if date_txt else ''
+
+        items.append(f"""
+      <div class="finding-card">
+        <div class="finding-index">{i+1:02d}</div>
+        <div class="finding-body">
+          <div class="grade-head">
+            <span class="ea-badge" style="color:{g_color};border-color:{g_color}33;background:{g_color}14;">{grade_txt}{score_txt}</span>
+            {date_html}
+          </div>
+          {quote_html}
+          {ctx_html}
+          {rsn_html}
+          <div class="grade-alts"><span class="grade-alts-label">换一种说法</span>{alts_html}</div>
+        </div>
+      </div>""")
+    return "\n".join(items)
+
+
 def render_relationship_stage(rel_stage):
     """渲染关系阶段时间线"""
     if not rel_stage:
@@ -358,10 +698,15 @@ def render_relationship_stage(rel_stage):
     is_situ     = rel_stage.get("is_situationship", False)
     situ_ev     = escape_html(rel_stage.get("situationship_evidence", ""))
     stage_risk  = escape_html(rel_stage.get("stage_risk", ""))
-    adv_path    = escape_html(rel_stage.get("advancement_path", ""))
+    # advancement_path 是 {value, evidence_level, reason} 包装对象，
+    # value 为 None 表示「这个字段不该有值」，此时显示 reason 才是人话。
+    adv_path    = escape_html(unwrap(rel_stage.get("advancement_path", "")))
 
     stages = ["初识试探期", "暧昧升温期", "拉锯确认期", "实名化前夜", "正式确认期", "关系维护期", "降温衰退期"]
-    current_idx = stages.index(stage) if stage in stages else -1
+    # 枚举槽会被散文污染。实测当前值是「朋友边界（关系定义已完成，不是模糊地带）」——
+    # 那是 relationship_type，根本不是 stage，所以前缀兜底也匹配不上。
+    matched = enum_key(stage, stages)
+    current_idx = stages.index(matched) if matched else -1
 
     nodes_html = ""
     for i, s in enumerate(stages):
@@ -369,6 +714,18 @@ def render_relationship_stage(rel_stage):
         cls = "stage-node active" if is_current else "stage-node"
         label_cls = "stage-label active-label" if is_current else "stage-label"
         nodes_html += f'<div class="{cls}"><div class="stage-dot"></div><div class="{label_cls}">{escape_html(s)}</div></div>'
+
+    # 匹配不上时**不能**保留时间线：7 个节点全灰等于告诉读者「你们不在任何阶段」，
+    # 比不画更误导（实测就是这个状态）。改成直接把原值摆在明处。
+    if current_idx < 0:
+        nodes_html = (
+            '<div style="padding:10px 14px;border:1px dashed var(--border);'
+            'border-radius:var(--radius-sm);font-size:13px;color:var(--text-muted);">'
+            '阶段判定：' + (escape_html(stage) or '未给出') +
+            '<span style="font-size:12px;color:var(--text-subtle);">'
+            '　（不在标准七段之内，故不画时间线——全灰的进度条会被读成「不在任何阶段」）'
+            '</span></div>'
+        )
 
     situ_badge = ""
     if is_situ:
@@ -489,24 +846,62 @@ def render_personality_portrait(portrait, contact_name):
                     b5_rows += f'<div class="b5-row"><span class="b5-label">{label_cn}</span><span class="b5-val" style="color:{level_color}">{val}</span></div>'
             b5_html = f'<div class="b5-section">{b5_rows}</div>'
 
+        # core_fear 与 observable_signals 以前**从不渲染**（源码引用次数 0）。
+        # 而「没结论、但有观察」正是这套框架最诚实的部分：
+        # evidence_level=insufficient 时 value 为 null，但 observable_signals 非空。
+        # 不画出来，等于把最谨慎的那些判断整批丢掉。
+        cf = person_data.get("core_fear") or {}
+        cf_html = ""
+        if isinstance(cf, dict):
+            cf_val = escape_html(cf.get("value") or "")
+            cf_lv  = escape_html(cf.get("evidence_level") or "")
+            cf_why = escape_html(cf.get("reason") or "")
+            obs = [o for o in (cf.get("observable_signals") or []) if o]
+            if cf_val or cf_why or obs:
+                obs_html = "".join(
+                    '<div style="padding:2px 0;color:var(--text-muted);font-size:12px;">'
+                    '· ' + escape_html(o if isinstance(o, str) else str(o)) + '</div>'
+                    for o in obs
+                )
+                cf_html = (
+                    '<div style="margin-top:12px;padding:10px 12px;border-left:2px solid var(--border);">'
+                    '<div style="font-size:12px;font-weight:700;color:var(--text-muted);'
+                    'letter-spacing:.05em;margin-bottom:6px;">核心恐惧'
+                    + ('　<span style="font-weight:400;color:var(--text-subtle);">证据 '
+                       + cf_lv + '</span>' if cf_lv else '')
+                    + '</div>'
+                    + ('<div style="font-size:13px;margin-bottom:4px;">' + cf_val + '</div>' if cf_val else '')
+                    + ('<div style="font-size:12px;color:var(--text-muted);line-height:1.6;">'
+                       + cf_why + '</div>' if cf_why else '')
+                    + (('<div style="margin-top:8px;"><div style="font-size:11px;'
+                        'color:var(--text-subtle);margin-bottom:3px;">观察到的信号（尚未构成结论）</div>'
+                        + obs_html + '</div>') if obs_html else '')
+                    + '</div>'
+                )
+
         return f"""
         <div class="portrait-person">
           <div class="portrait-person-title">{label}</div>
           <div class="portrait-traits">{traits_html}</div>
           {f'<div class="portrait-needs"><span class="needs-label">底层需求</span> {core_needs}</div>' if core_needs else ''}
           {f'<div class="portrait-defenses-title">防御机制</div>{defenses_html}' if defenses_html else ''}
+          {cf_html}
           {b5_html}
           {f'<div class="portrait-trust"><span class="trust-label">信任架构</span> {trust}</div>' if trust else ''}
         </div>"""
 
-    # 需求-行为解码
+    # 需求-行为解码。**双方都要渲染** —— 以前只渲染对方的，
+    # 用户自己那份 needs_behavior_map 被静默丢弃（写进 JSON、读者永远看不到）。
     needs_map_html = ""
     user_data    = portrait.get("user", {})
     partner_data = portrait.get("partner", {})
-    partner_needs_map = partner_data.get("needs_behavior_map", [])
-    if partner_needs_map:
+
+    def render_needs_map(person_data, who):
+        rows = person_data.get("needs_behavior_map", []) or []
+        if not rows:
+            return ""
         items = ""
-        for m in partner_needs_map:
+        for m in rows:
             behavior = escape_html(m.get("behavior", ""))
             need     = escape_html(m.get("need", ""))
             decode   = escape_html(m.get("decode", ""))
@@ -517,7 +912,12 @@ def render_personality_portrait(portrait, contact_name):
           <div class="nbm-need">{need}</div>
           {f'<div class="nbm-decode">{decode}</div>' if decode else ''}
         </div>"""
-        needs_map_html = f'<div class="nbm-section"><div class="nbm-title">行为解码：对方真正想要的是什么</div><div class="nbm-list">{items}</div></div>'
+        return (f'<div class="nbm-section"><div class="nbm-title">'
+                f'行为解码：{who}真正想要的是什么</div>'
+                f'<div class="nbm-list">{items}</div></div>')
+
+    needs_map_html = (render_needs_map(partner_data, escape_html(contact_name)) +
+                      render_needs_map(user_data, "你"))
 
     user_html    = render_person(user_data, "你")
     partner_html = render_person(partner_data, escape_html(contact_name))
@@ -542,8 +942,8 @@ def render_language_patterns(lang_patterns, linguistic_stats, contact_name):
 
     density_color = {"高": "#ef4444", "中": "#eab308", "低": "#22c55e"}
 
-    hedging_color     = density_color.get(hedging.split(" ")[0] if hedging else "", "#6b7280")
-    conditional_color = density_color.get(conditional.split(" ")[0] if conditional else "", "#6b7280")
+    hedging_color     = density_color.get(enum_key(hedging, ("高", "中", "低")), "#6b7280")
+    conditional_color = density_color.get(enum_key(conditional, ("高", "中", "低")), "#6b7280")
 
     future_color = {"真实期待": "#22c55e", "虚假承诺": "#ef4444", "中性": "#6b7280"}.get(future_ori, "#6b7280")
 
@@ -552,6 +952,30 @@ def render_language_patterns(lang_patterns, linguistic_stats, contact_name):
     we_them  = linguistic_stats.get("pronoun_we_count", {}).get("them", 0)
     rev_me   = linguistic_stats.get("revoke_count", {}).get("me", 0)
     rev_them = linguistic_stats.get("revoke_count", {}).get("them", 0)
+
+    # 12 情绪受控词表分布（词表见 intent-taxonomy.md，与词表无关的标签走灰）。
+    # 缺席就整行不出现——不画一排 0。
+    emo_chips = []
+    for e in (lang_patterns.get("emotion_distribution") or []):
+        if not isinstance(e, dict):
+            continue
+        raw_label = str(e.get("label", "") or "").strip()
+        if not raw_label:
+            continue
+        matched = enum_key(raw_label, EMOTION_VOCAB)
+        color = "#a855f7" if matched else "#6b7280"   # 词表外走灰，但仍然显示
+        emo_chips.append(
+            f'<span class="horseman-chip" style="color:{color};background:{color}14;'
+            f'border-color:{color}33;">{escape_html(raw_label)} '
+            f'你{safe_int(e.get("me", 0))}/TA{safe_int(e.get("them", 0))}</span>')
+    emo_html = ""
+    if emo_chips:
+        emo_html = (
+            '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;">'
+            + "".join(emo_chips) +
+            '</div><p style="font-size:11px;color:var(--text-subtle);margin-top:8px;line-height:1.6;">'
+            '「平静」是中性值不是冷淡；情绪分布是词表层产物，与可选的 affect 层是两条独立链路。</p>'
+        )
 
     return f"""
     <div class="lang-wrap">
@@ -583,6 +1007,7 @@ def render_language_patterns(lang_patterns, linguistic_stats, contact_name):
         <span class="lang-stat-item">撤回消息：你 {rev_me} 次 / 对方 {rev_them} 次</span>
       </div>
       {f'<div class="lang-finding"><span class="lang-finding-label">语言洞察</span><p>{key_finding}</p></div>' if key_finding else ''}
+      {emo_html}
     </div>"""
 
 
@@ -671,9 +1096,30 @@ def render_html(stats, analysis, contact_name):
         analysis.get("language_patterns"), linguistic_stats, contact_name
     )
     patriarch_wisdom_html  = render_patriarch_wisdom(analysis.get("patriarch_wisdom"))
+    # 新增模块（缺席即不渲染，见各自函数内的 falsy 守卫）
+    # 注意：显式 null 与「缺键」不同——都走函数内的 `if not x: return ""`，
+    # 所以这两个键绝不能进 analysis_contract.CRASH_ON_NULL。
+    intent_profile_html    = render_intent_profile(analysis.get("intent_profile"))
+    affinity_html          = render_affinity(analysis.get("affinity"))
+    moments_html           = render_moments(analysis.get("moments"))
+    reply_grades_html      = render_reply_grades(analysis.get("reply_grades"))
 
     chart = build_chart_data(stats)
     chart_data_js = json.dumps(chart, ensure_ascii=False)
+
+    # 情感层可用时才出这张图；缺了整块不出现，不是画一条空线。
+    # **刻意只画效价走势，不画 within_r / between_r**——那个数是给分析者的，
+    # 报告读者拿到只会误读（between 数值更大，极易被读成「跟得更紧」）。
+    valence_card_html = ""
+    if chart.get("has_valence"):
+        valence_card_html = (
+            '<div class="chart-card" style="margin-bottom:12px">'
+            '<div class="chart-title">情绪走势（每日效价均值 · −1 极负 ↔ +1 极正）</div>'
+            '<div class="chart-wrap"><canvas id="valenceChart"></canvas></div>'
+            '<div class="chart-title" style="margin-top:8px;font-size:11px;opacity:.6">'
+            '只看走势，别读单点。已知弱点：疲惫类表达偏中性（「好累啊」≈ 0）。'
+            '</div></div>'
+        )
     date_str = datetime.now().strftime("%Y.%m.%d")
 
     date_range = basic.get("date_range", ["?", "?"])
@@ -683,7 +1129,8 @@ def render_html(stats, analysis, contact_name):
     speed_ratio = reply.get("speed_ratio", 1)
 
     trend_icon = {"升温中": "🔥", "平稳维持": "➡️", "逐渐降温": "❄️", "已经凉透": "💀"}.get(
-        analysis.get("relationship_trend", ""), "📊"
+        enum_key(analysis.get("relationship_trend", ""),
+                 ("升温中", "平稳维持", "逐渐降温", "已经凉透")), "📊"
     )
 
     return f"""<!DOCTYPE html>
@@ -1688,6 +2135,66 @@ def render_html(stats, analysis, contact_name):
     line-height: 1.7;
     opacity: .9;
   }}
+
+  /* ── Affinity（六维好感度）── */
+  .affinity-wrap {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 18px 20px;
+  }}
+  .affinity-row {{
+    display: grid;
+    grid-template-columns: 128px 1fr 44px;
+    gap: 6px 12px;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }}
+  .affinity-row:last-of-type {{ border-bottom: none; }}
+  .affinity-label {{ font-size: 12px; font-weight: 600; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }}
+  .affinity-weight {{ font-size: 10px; color: var(--text-subtle); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; font-weight: 500; }}
+  .affinity-track {{ height: 8px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }}
+  .affinity-fill {{ height: 100%; border-radius: 99px; transition: width .3s; }}
+  .affinity-val {{ font-size: 12px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }}
+  .affinity-meta {{ grid-column: 2 / 4; font-size: 10px; color: var(--text-subtle); letter-spacing: .04em; }}
+  .affinity-deriv {{ grid-column: 2 / 4; font-size: 10px; color: var(--text-subtle); line-height: 1.6; margin: 0; }}
+  .affinity-note {{ grid-column: 2 / 4; font-size: 11px; color: var(--text-muted); line-height: 1.65; margin: 0; }}
+  .affinity-total {{ margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; color: var(--text-muted); }}
+  .affinity-total b {{ font-size: 18px; font-variant-numeric: tabular-nums; }}
+  .affinity-total-na {{ color: var(--text-subtle); font-size: 12px; }}
+
+  /* ── Intent Profile（对话动作分类）── */
+  .intent-wrap {{ display: flex; flex-direction: column; }}
+  .intent-caveat {{ font-size: 11px; color: var(--text-subtle); line-height: 1.65; margin: 10px 0 0; }}
+  .intent-ev {{ margin-top: 16px; }}
+  .intent-ev-title {{ font-size: 11px; font-weight: 700; color: var(--text-subtle); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 8px; }}
+  .intent-ev-date {{ font-size: 10px; color: var(--text-subtle); font-style: normal; margin-left: 8px; }}
+
+  /* ── Moments（关键时刻时间线）── */
+  .moments-list {{ display: flex; flex-direction: column; gap: 12px; }}
+  .moment-item {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border-hover);
+    border-radius: var(--radius-sm);
+    padding: 16px 18px;
+  }}
+  .moment-minor {{ opacity: .62; }}
+  .moment-head {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }}
+  .moment-date {{ font-size: 11px; color: var(--text-subtle); font-variant-numeric: tabular-nums; letter-spacing: .04em; }}
+  .moment-kind {{ font-size: 11px; font-weight: 700; border: 1px solid; border-radius: 99px; padding: 2px 10px; }}
+  .moment-sender {{ font-size: 11px; font-weight: 600; }}
+  .moment-status {{ font-size: 10px; color: var(--text-subtle); border: 1px solid var(--border); border-radius: 99px; padding: 2px 8px; }}
+  .moment-title {{ font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 8px; }}
+  .moment-resolution {{ font-size: 11px; color: var(--text-subtle); line-height: 1.65; margin: 6px 0 0; }}
+
+  /* ── Reply Grades（回复评分）── */
+  .grade-head {{ display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }}
+  .grade-date {{ font-size: 11px; color: var(--text-subtle); font-variant-numeric: tabular-nums; }}
+  .grade-ctx {{ font-size: 12px; color: var(--text-subtle); line-height: 1.65; margin-bottom: 8px; }}
+  .grade-alts {{ margin-top: 12px; }}
+  .grade-alts-label {{ display: block; font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-subtle); margin-bottom: 6px; }}
 </style>
 </head>
 <body>
@@ -1842,6 +2349,7 @@ def render_html(stats, analysis, contact_name):
       <div class="chart-title">消息趋势（最近60天）</div>
       <div class="chart-wrap"><canvas id="trendChart"></canvas></div>
     </div>
+    {valence_card_html}
     <div class="charts-row">
       <div class="chart-card">
         <div class="chart-title">活跃时段分布</div>
@@ -1860,6 +2368,12 @@ def render_html(stats, analysis, contact_name):
     {lang_patterns_html}
   </section>''' if lang_patterns_html else ''}
 
+  <!-- 对话动作分类（模块 H） -->
+  {f'''<section class="section">
+    <p class="section-label">对话动作分类 🗣️</p>
+    {intent_profile_html}
+  </section>''' if intent_profile_html else ''}
+
   <!-- ⚠️ 危险预警 -->
   <section class="section">
     <p class="section-label">⚠️ 危险预警</p>
@@ -1871,6 +2385,17 @@ def render_html(stats, analysis, contact_name):
     <p class="section-label">关系阶段定位</p>
     {relationship_stage_html}
   </section>''' if relationship_stage_html else ''}
+
+  <!-- 六维好感度 + 关键时刻（与上面的「情感对称性」正交，必须分开呈现） -->
+  {f'''<section class="section">
+    <p class="section-label">六维好感度 · 对方一侧</p>
+    {affinity_html}
+  </section>''' if affinity_html else ''}
+
+  {f'''<section class="section">
+    <p class="section-label">关键时刻时间线</p>
+    {moments_html}
+  </section>''' if moments_html else ''}
 
   <!-- 关系分析：Sternberg + Gottman + 情感不对称 -->
   <section class="section">
@@ -1908,6 +2433,14 @@ def render_html(stats, analysis, contact_name):
     <p class="section-label">🎯 军师建议</p>
     {strategist_html}
   </section>
+
+  <!-- 回复评分（模块 D6） -->
+  {f'''<section class="section">
+    <p class="section-label">📝 回复评分 · 校准你的说法</p>
+    <div class="findings-list">
+      {reply_grades_html}
+    </div>
+  </section>''' if reply_grades_html else ''}
 
   <!-- 祖师爷寄语 -->
   {f'''<section class="section">
@@ -1992,6 +2525,29 @@ new Chart(document.getElementById('trendChart'), {{
     }}
   }}
 }});
+
+if (d.has_valence && document.getElementById('valenceChart')) {{
+new Chart(document.getElementById('valenceChart'), {{
+  type: 'line',
+  data: {{
+    labels: d.valence_labels,
+    datasets: [
+      {{ label: '我', data: d.valence_me, borderColor: '#a855f7', backgroundColor: 'transparent',
+         tension: 0.35, pointRadius: 0, borderWidth: 2, spanGaps: true }},
+      {{ label: '对方', data: d.valence_them, borderColor: '#38bdf8', backgroundColor: 'transparent',
+         tension: 0.35, pointRadius: 0, borderWidth: 2, spanGaps: true }}
+    ]
+  }},
+  options: {{
+    ...base,
+    plugins: {{ legend: {{ display: true, labels: {{ color: '#3a3a4a', font: {{ size: 11 }} }} }} }},
+    scales: {{
+      x: {{ ticks: {{ color: '#3a3a4a', maxTicksLimit: 8, font: {{ size: 11 }} }}, grid: {{ color: 'rgba(255,255,255,0.03)' }}, border: {{ display: false }} }},
+      y: {{ suggestedMin: -0.4, suggestedMax: 0.4, ticks: {{ color: '#3a3a4a', font: {{ size: 11 }} }}, grid: {{ color: 'rgba(255,255,255,0.03)' }}, border: {{ display: false }} }}
+    }}
+  }}
+}});
+}}
 
 new Chart(document.getElementById('hourChart'), {{
   type: 'bar',

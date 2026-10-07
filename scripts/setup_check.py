@@ -8,6 +8,7 @@ setup_check.py - 跨平台环境检查与引导
   - 检查微信是否正在运行（Windows / macOS）
 """
 import argparse
+import importlib
 import json
 import shutil
 import subprocess
@@ -20,6 +21,11 @@ DEFAULT_DECRYPTOR_DIR = REPO_ROOT / "vendor" / "wechat-decrypt"
 DEFAULT_DECRYPTOR_DIR_DISPLAY = Path("vendor") / "wechat-decrypt"
 DECRYPTOR_REPO = "https://github.com/ylytdeng/wechat-decrypt"
 DEPENDENCIES = ("pycryptodome", "zstandard")
+DEFAULT_MODEL_CACHE_DIR = REPO_ROOT / "vendor" / "hf_cache"
+
+# 情感计算层（可选）。缺任何一项都不影响主分析——stats.json 里 affect.status
+# 会是 disabled，消费方判 status 即可。
+AFFECT_REQUIRED = ("numpy", "onnxruntime", "tokenizers", "huggingface_hub")
 SUPPORTED_PLATFORMS = {"win32": "Windows", "darwin": "macOS"}
 RUNTIME_DIRS = (
     REPO_ROOT / "vendor",
@@ -126,6 +132,48 @@ def check_wechat_process():
     return False, [], "当前平台未实现微信进程检测"
 
 
+def check_affect_env(model_cache_dir=None):
+    """诊断情感计算层（affect）的可选依赖与模型缓存。
+
+    **只诊断，不下载。** 下载由 `stats_analyzer.py --affect auto` 在主流程里按需
+    触发——setup_check 擅自拉 90MB 会让人措手不及。这里的职责是把「缺什么」讲
+    清楚，让人自己决定要不要装。
+
+    返回的 `enabled` 表示「现在就能跑」；`hint` 说明下一步该做什么。
+    """
+    out = {"enabled": False, "versions": {}, "missing": [],
+           "model_cache": None, "model_cached": None, "hint": ""}
+
+    for mod in AFFECT_REQUIRED:
+        try:
+            out["versions"][mod] = getattr(importlib.import_module(mod), "__version__", "?")
+        except ImportError:
+            out["missing"].append(mod)
+
+    if out["missing"]:
+        out["hint"] = (f"缺少 {'、'.join(out['missing'])}。装法："
+                       "python -m pip install -r requirements-optional.txt")
+        return out
+
+    cache = Path(model_cache_dir) if model_cache_dir else DEFAULT_MODEL_CACHE_DIR
+    out["model_cache"] = display_path(cache)
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import embed_hf
+        out["model_cached"] = embed_hf.cached(cache_dir=str(cache))
+        out["model"] = embed_hf.DEFAULT_MODEL
+    except Exception as exc:
+        out["hint"] = f"依赖齐了，但 embed_hf 导入失败：{type(exc).__name__}: {exc}"
+        return out
+
+    out["enabled"] = bool(out["model_cached"])
+    if not out["model_cached"]:
+        out["hint"] = ("依赖齐了，但模型尚未下载。首次运行 "
+                       "`stats_analyzer.py --affect auto` 会下载约 90MB 到上述目录"
+                       "（大陆会自动回退 hf-mirror.com 镜像）。")
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="检查 she-love-me 运行环境")
     parser.add_argument(
@@ -137,6 +185,12 @@ def main():
         "--decryptor-dir",
         default=str(DEFAULT_DECRYPTOR_DIR),
         help=f"wechat-decrypt 目录，默认 {DEFAULT_DECRYPTOR_DIR_DISPLAY}",
+    )
+    parser.add_argument(
+        "--ensure-affect",
+        action="store_true",
+        help="诊断情感计算层（affect）的可选依赖与模型缓存。"
+             "只诊断，不下载模型——下载由 stats_analyzer.py --affect auto 触发",
     )
     args = parser.parse_args()
 
@@ -153,6 +207,11 @@ def main():
         "notes": build_notes(),
         "actions": [],
     }
+
+    # 放在所有 early-exit 之前——否则微信没开时，`--ensure-affect` 的诊断结果会
+    # 被「请先打开微信」那条错误吞掉，而它跟微信毫无关系。
+    if args.ensure_affect:
+        report["affect"] = check_affect_env()
 
     created_dirs = ensure_runtime_dirs()
     if created_dirs:
